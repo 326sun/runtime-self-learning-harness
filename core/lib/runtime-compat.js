@@ -1,0 +1,118 @@
+// Shared compatibility layer. Keep public exports stable across Harness releases.
+// Compatibility helpers retained for the standalone Harness core.
+import path from "path";
+import { fileURLToPath } from "url";
+
+export const HARNESS_BUS_SKIP = Symbol.for("harness.event-bus.skip");
+
+const PLUGIN_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function noop() {}
+
+function fallbackBus(existing = {}) {
+  return {
+    ...existing,
+    listCapabilities: typeof existing.listCapabilities === "function" ? existing.listCapabilities.bind(existing) : () => [],
+    getCapability: typeof existing.getCapability === "function" ? existing.getCapability.bind(existing) : () => null,
+    hasHandler: typeof existing.hasHandler === "function" ? existing.hasHandler.bind(existing) : () => false,
+    request: typeof existing.request === "function"
+      ? existing.request.bind(existing)
+      : async (type) => { throw new Error(`EventBus request unavailable: ${type}`); },
+    subscribe: typeof existing.subscribe === "function" ? existing.subscribe.bind(existing) : () => noop,
+  };
+}
+
+function isMethodBasedConfig(config) {
+  return config && typeof config.getAll === "function";
+}
+
+function normalizeConfig(config = {}) {
+  if (isMethodBasedConfig(config)) {
+    return {
+      getAll: (opts) => config.getAll(opts),
+      setMany: typeof config.setMany === "function" ? (values) => config.setMany(values) : noop,
+      getSchema: typeof config.getSchema === "function" ? () => config.getSchema() : () => null,
+      getValues: (opts) => config.getAll(opts),
+    };
+  }
+  return {
+    ...config,
+    getAll: () => {
+      const values = {};
+      for (const key of Object.keys(config)) {
+        if (typeof config[key] !== "function") values[key] = config[key];
+      }
+      return values;
+    },
+    setMany: typeof config.setMany === "function" ? config.setMany.bind(config)
+      : typeof config.update === "function" ? config.update.bind(config)
+      : noop,
+    getSchema: typeof config.getSchema === "function" ? config.getSchema.bind(config) : () => null,
+    getValues: function (opts) { return this.getAll(opts); },
+    update: typeof config.update === "function" ? config.update.bind(config) : noop,
+    set: typeof config.set === "function" ? config.set.bind(config) : noop,
+  };
+}
+
+function normalizeNetwork(network) {
+  if (!network) return { fetch: null };
+  if (typeof network.fetch === "function") {
+    return { fetch: network.fetch.bind(network) };
+  }
+  return { fetch: null };
+}
+
+export function normalizeRuntimeContext(ctx = {}) {
+  const log = ctx.log || {};
+  return {
+    ...ctx,
+    pluginDir: ctx.pluginDir || PLUGIN_DIR,
+    dataDir: ctx.dataDir || null,
+    bus: fallbackBus(ctx.bus || {}),
+    log: {
+      info: typeof log.info === "function" ? log.info.bind(log) : noop,
+      warn: typeof log.warn === "function" ? log.warn.bind(log) : noop,
+      error: typeof log.error === "function" ? log.error.bind(log) : noop,
+      debug: typeof log.debug === "function" ? log.debug.bind(log) : noop,
+    },
+    config: normalizeConfig(ctx.config),
+    network: normalizeNetwork(ctx.network),
+  };
+}
+
+export { isMethodBasedConfig };
+
+export function definePlugin(lifecycle = {}) {
+  return class HarnessRuntimeCompatPlugin {
+    async onload() {
+      if (typeof lifecycle.onload === "function") {
+        return lifecycle.onload(normalizeRuntimeContext(this.ctx || {}), {
+          register: (disposable) => {
+            if (typeof this.register === "function") this.register(disposable);
+          },
+        });
+      }
+    }
+
+    async onunload() {
+      if (typeof lifecycle.onunload === "function") {
+        return lifecycle.onunload(normalizeRuntimeContext(this.ctx || {}));
+      }
+    }
+  };
+}
+
+export function defineTool(tool = {}) {
+  return {
+    parameters: { type: "object", properties: {} },
+    ...tool,
+  };
+}
+
+export function defineBusHandler(handler = {}) {
+  return handler;
+}
+
+export function requestBus(ctx, type, payload, options) {
+  return normalizeRuntimeContext(ctx).bus.request(type, payload, options);
+}
