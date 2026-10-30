@@ -1,58 +1,112 @@
-# Runtime Self-Learning Harness 6.2.2
+# Runtime Self-Learning Harness 6.2.3
 
-这是独立目录中的 6.2 DeepSeek Harness 插件版。它通过 MCP stdio server 把长期记忆工具接入 Harness，内置自己的记忆核心和默认数据目录，不依赖其他宿主或 `6.2/` 目录。
+一个独立的 DeepSeek Harness 原生 DSH bundle：让 Agent 在本地观察任务过程、沉淀可追溯记忆、按项目范围检索，并在下一步模型调用前自动注入经过治理的经验。
 
-## 官方 Harness 插件安装
+它自带记忆核心和数据目录，不引用其他产品源码，也不依赖另一个宿主插件。MCP stdio 入口仍保留，用于兼容没有原生 bundle 管理器的环境。
 
-这是可由 DeepSeek Harness 官方插件管理器识别的 DSH bundle，包含 `dsh.bundle` 和 `cordis.patch.yml`。
+## 解决的问题
+
+普通长期记忆通常只保存文本，缺少来源、作用域和修订边界。这个插件把运行时经验拆成四条可检查的链：
+
+```text
+Harness session/event
+        ↓
+受限 episode 与任务经验
+        ↓
+模式识别、事实修订、项目隔离
+        ↓
+下一步模型调用前的作用域记忆注入
+        ↓
+失败反馈与重复模式 → 技能候选 → 审核后激活
+```
+
+- **自动观察与学习**：订阅 DSH 的 `session/event`，记录用户消息、工具调用、工具结果和助手回合；Episode 只保存任务/工具摘要与 opaque session hash，不保存原始对话正文。
+- **自动记忆注入**：通过 DSH 的 `agent/pre-step` 在当前步骤组装作用域记忆；只注入可用、已治理且与当前项目匹配的条目。
+- **技能演化闭环**：重复失败和反馈先生成候选，按成功次数、回归次数和风险门槛进入 staged/active 状态；生成的技能文件写入数据目录，不覆盖安装包。
+- **可审计记忆**：支持时态事实、supersession、episode provenance、core/archive 分层、逻辑删除、导出、预览导入和逐条批准。
+
+## 官方安装
+
+这是官方 DSH bundle，包含 `dsh.bundle` 和 `cordis.patch.yml`：
 
 ```powershell
 dsh plugin --profile web add github:326sun/runtime-self-learning-harness
 ```
 
-安装后重启对应 profile。插件会原生注册 `memory_search`、`memory_list`、`memory_get` 等长期记忆工具；默认数据目录为 `<HARNESS_HOME>/self-learning-harness/`。
+安装后重启对应 profile。原生 bundle 会注册 17 个工具，并自动连接 DSH 的 session 与 agent 生命周期。
 
-## MCP 兼容安装
+默认数据目录：
 
-在本目录执行：
-
-```powershell
-npm install
+```text
+<HARNESS_HOME>/self-learning-harness/
+├── patterns.json
+├── episodes.jsonl
+├── experience_log.jsonl
+├── activity_log.jsonl
+├── skill_candidates.json
+├── active_skills.json
+└── generated/skills/self-learning/SKILL.md
 ```
-
-要求 Node.js 22 或更高版本。
-
-## Harness 配置
-
-把下面的配置加入 DeepSeek Harness 对应 Agent 的 Cordis 配置；`cwd` 指向本目录。默认数据目录是 `<HARNESS_HOME>/self-learning-harness/`；只有明确设置 `HARNESS_DATA_DIR` 时才会使用其他数据目录。
-
-```yaml
-- id: mcp-harness-memory
-  name: '@deepseek-ai/dsh-mcp-client'
-  config:
-    serverName: harness-memory
-    transport: stdio
-    command: node
-    args: ['server.js']
-    cwd: 'D:/openharness/自学习/6.2harness'
-    env:
-      HARNESS_DATA_DIR: 'C:/Users/<你的用户名>/.harness/self-learning-harness'
-      HARNESS_PROJECT: 'your-project'
-    failOnStartupError: true
-```
-
-启动后，Harness 会注册名称类似 `mcp__harness-memory__memory_search` 的工具。默认使用 general 作用域；设置 `HARNESS_PROJECT` 后，项目记忆会按项目隔离。
 
 ## 工具
 
-提供 `memory_search`、`memory_list`、`memory_get`、`memory_history`、`memory_provenance`、`memory_episodes`、`memory_upsert`、`memory_delete`、`memory_approve`、`memory_export`、`memory_preview_import` 和 `memory_import`。
+### 记忆工具
 
-写入、删除、批准和导入都是显式工具调用；删除仍是逻辑隐藏，保留原始日志和历史备份。Episode 只保存受限任务/工具摘要和 opaque session hash，不保存原始对话正文。
+`memory_search`、`memory_list`、`memory_get`、`memory_history`、`memory_provenance`、`memory_episodes`、`memory_upsert`、`memory_delete`、`memory_approve`、`memory_export`、`memory_preview_import`、`memory_import`。
 
-## 验证
+写入、删除、批准和导入都是显式操作。导入必须先预览，再使用同一数据版本的 `previewId`；导入项先进入待审核队列，事实替代需要单独批准。
+
+### 自学习工具
+
+| 工具 | 用途 |
+| --- | --- |
+| `learning_status` | 查看观察回合、注入次数、模式数量和技能数量 |
+| `learning_observe` | 手动提交一个受限回合，用于诊断或离线回放；正常 Harness 回合会自动观察 |
+| `learning_inject` | 预览某个查询和项目将获得的记忆注入 |
+| `learning_skill_evolve` | 运行技能候选晋级循环；默认不直接写安装目录 |
+| `learning_skill_render` | 将当前模式和已激活技能渲染到数据目录 |
+
+自动链路由原生 DSH 事件驱动：
+
+- `session/event` → 观察用户消息、工具调用/结果和助手消息；
+- `agent/pre-step` → 注入当前作用域的可用记忆；
+- `agent/session-start` → 为新会话准备初始记忆上下文。
+
+## 记忆与治理
+
+- `core` 记忆可在预算范围内参与自动注入，`archive` 记忆通过显式检索使用。
+- 项目范围从 Harness session 的工作目录推导；项目记忆不会泄露到其他项目。
+- 本地检索组合 CJK BM25、RRF、实体/别名/关系和字符 n-gram，不依赖云端向量数据库。
+- 事实保留 `validFrom`、`validTo`、`learnedAt` 与替代关系，不静默覆盖历史。
+- 删除是逻辑隐藏；旧日志和已有外部备份不会被承诺安全擦除。
+- 技能文件生成到 `<dataDir>/generated/`，候选晋级受成功次数、回归次数和治理门槛限制。
+- 默认不调用外部模型，不上传原始对话，不执行自动代码补丁。
+
+## MCP 兼容入口
+
+没有原生 bundle 管理器时，可以使用独立 stdio server：
 
 ```powershell
-npm test
+npm install
+node server.js
 ```
 
-这个插件已在本地 MCP server 层做工具注册、作用域和记忆读写测试；完整的 DeepSeek Harness 启动验证需要安装 Harness 并在其 Agent scope 中启用 MCP client。它内置 `core/`，复制或发布整个目录即可独立运行。
+MCP 入口提供记忆工具；自动观察、自动注入和技能演化需要原生 DSH bundle 的事件与 agent 契约。
+
+## 开发与验证
+
+要求 Node.js 24.9+。本地验证：
+
+```powershell
+npm install
+npm test
+npm audit --omit=dev
+```
+
+测试覆盖：记忆读写、作用域、原生 17 工具注册、DSH session 事件观察、工具调用配对、自动注入和技能演化 dry-run。
+
+生产宿主仍应使用实际 profile 做一次安装、真实多轮对话、项目切换、导入预览和技能晋级验收。
+
+## 许可
+
+MIT License。

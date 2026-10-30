@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { execute } from "./core/tools/memory.js";
+import { executeLearning, getRuntime } from "./core/tools/learning.js";
 
 export const name = "runtime-self-learning-harness";
 export const inject = ["tools"];
@@ -52,7 +53,23 @@ function register(ctx, name, description, parameters, map = (args) => args) {
   }));
 }
 
+function registerLearning(ctx, name, description, parameters, map = (args) => args) {
+  ctx.tools.register(defineTool({
+    name,
+    description,
+    parameters,
+    output,
+    async execute(args) {
+      const value = await executeLearning(map(args), { ...context(), owner: ctx, log: ctx.log });
+      return value;
+    },
+  }));
+}
+
 export function apply(ctx) {
+  // Start the event bridge during plugin activation, so automatic observation
+  // does not depend on a model calling one of the diagnostic tools first.
+  getRuntime({ ...context(), owner: ctx, log: ctx.log });
   register(ctx, "memory_search", "Search approved and archived memories in the active project scope.",
     { query: { type: "string", required: true, description: "Search query, up to 4000 characters." }, ...scopeParameters },
     (args) => ({ action: "search", ...args }));
@@ -89,4 +106,18 @@ export function apply(ctx) {
   register(ctx, "memory_import", "Import a previously previewed bundle into the pending review queue.",
     { bundle: { type: "object", required: true, additionalProperties: true }, previewId: { type: "string", required: true } },
     (args) => ({ action: "import", ...args }));
+
+  registerLearning(ctx, "learning_status", "Show the native Harness self-learning runtime status.",
+    { }, (args) => ({ action: "status", ...args }));
+  registerLearning(ctx, "learning_observe", "Manually submit a bounded turn for observation; normal Harness turns are observed automatically.",
+    { turn: { type: "object", required: true, additionalProperties: true } },
+    (args) => ({ action: "observe", ...args }));
+  registerLearning(ctx, "learning_inject", "Preview scoped learned context that would be injected into the next model step.",
+    { query: { type: "string" }, project: { type: "string" } },
+    (args) => ({ action: "inject", ...args }));
+  registerLearning(ctx, "learning_skill_evolve", "Run the review-gated skill evolution loop and refresh the generated self-learning skill.",
+    { options: { type: "object", additionalProperties: true } },
+    (args) => ({ action: "evolve", ...args }));
+  registerLearning(ctx, "learning_skill_render", "Render the current learned patterns and active skills to the local generated skill file.",
+    { }, (args) => ({ action: "render_skill", ...args }));
 }

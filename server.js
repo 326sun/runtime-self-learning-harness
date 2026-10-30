@@ -108,7 +108,7 @@ function registerMemoryTools(server, context) {
 }
 
 export function createServer(context = createContext()) {
-  const server = new McpServer({ name: "runtime-self-learning-harness", version: "6.2.1" });
+  const server = new McpServer({ name: "runtime-self-learning-harness", version: "6.2.3" });
   registerMemoryTools(server, context);
   return server;
 }
