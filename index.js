@@ -11,17 +11,23 @@ export const inject = ["tools"];
 const packageRoot = path.dirname(fileURLToPath(import.meta.url));
 const defaultDataDir = path.join(process.env.HARNESS_HOME || path.join(os.homedir(), ".harness"), "self-learning-harness");
 
-function context() {
+function context(overrides = {}) {
   const project = String(process.env.HARNESS_PROJECT || "").trim();
   return {
     dataDir: path.resolve(process.env.HARNESS_DATA_DIR || defaultDataDir),
     pluginDir: packageRoot,
     sessionPath: project ? path.join("projects", project) : path.join("sessions", "00000000"),
+    ...overrides,
   };
 }
 
-async function runMemory(input) {
-  const result = await execute(input, context());
+function executionContext(exec, owner) {
+  const sessionPath = exec?.agent?.session?.header?.cwd || null;
+  return context({ dataDir: owner?.dataDir, pluginDir: owner?.pluginDir, sessionPath, owner, log: owner?.log });
+}
+
+async function runMemory(input, exec, owner) {
+  const result = await execute(input, executionContext(exec, owner));
   const text = result.content?.find((block) => block.type === "text")?.text;
   const value = text ? JSON.parse(text) : (result.details || {});
   if (value?.ok === false) throw new Error(value.error || "memory operation failed");
@@ -47,8 +53,8 @@ function register(ctx, name, description, parameters, map = (args) => args) {
     description,
     parameters,
     output,
-    async execute(args) {
-      return runMemory(map(args));
+    async execute(args, exec) {
+      return runMemory(map(args), exec, ctx);
     },
   }));
 }
@@ -59,8 +65,8 @@ function registerLearning(ctx, name, description, parameters, map = (args) => ar
     description,
     parameters,
     output,
-    async execute(args) {
-      const value = await executeLearning(map(args), { ...context(), owner: ctx, log: ctx.log });
+    async execute(args, exec) {
+      const value = await executeLearning(map(args), { ...executionContext(exec, ctx), owner: ctx, log: ctx.log });
       return value;
     },
   }));
@@ -69,7 +75,7 @@ function registerLearning(ctx, name, description, parameters, map = (args) => ar
 export function apply(ctx) {
   // Start the event bridge during plugin activation, so automatic observation
   // does not depend on a model calling one of the diagnostic tools first.
-  getRuntime({ ...context(), owner: ctx, log: ctx.log });
+  getRuntime({ ...context({ dataDir: ctx.dataDir, pluginDir: ctx.pluginDir }), owner: ctx, log: ctx.log });
   register(ctx, "memory_search", "Search approved and archived memories in the active project scope.",
     { query: { type: "string", required: true, description: "Search query, up to 4000 characters." }, ...scopeParameters },
     (args) => ({ action: "search", ...args }));

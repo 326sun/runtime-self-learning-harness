@@ -1,4 +1,4 @@
-# Runtime Self-Learning Harness 6.2.4
+# Runtime Self-Learning Harness 6.2.5
 
 一个独立的 DeepSeek Harness 原生 DSH bundle：让 Agent 在本地观察任务过程、沉淀可追溯记忆、按项目范围检索，并在下一步模型调用前自动注入经过治理的经验。
 
@@ -103,7 +103,7 @@ npm test
 npm audit --omit=dev
 ```
 
-测试覆盖：记忆读写、作用域、原生 17 工具注册、DSH session 事件观察、工具调用配对、自动注入、重复失败聚类和技能演化 dry-run。
+测试覆盖：记忆读写、作用域、原生 17 工具注册、DSH session/turn 事件观察、工具调用配对、自动注入、重复失败聚类、宿主 dataDir 隔离和技能演化 dry-run。
 
 生产宿主仍应使用实际 profile 做一次安装、真实多轮对话、项目切换、导入预览和技能晋级验收。
 

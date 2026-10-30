@@ -1,6 +1,6 @@
 {
   "name": "runtime-self-learning-harness",
-  "version": "6.2.4",
+  "version": "6.2.5",
   "description": "Standalone DeepSeek Harness MCP plugin for Runtime Self-Learning 6.2",
   "type": "module",
   "main": "index.js",

@@ -91,19 +91,23 @@ function mapSessionEvent(session, event) {
         toolName: data.name || data.toolName || message.name || "tool",
         name: data.name || data.toolName || message.name || "tool",
         result: message,
-        isError: Boolean(data.error),
-        error: data.error,
+        isError: Boolean(data.error || message.error || message.isError),
+        error: data.error || message.error,
       }, meta];
     }
     case "assistant/message":
       return [{
-        type: "message_end",
-        message: {
-          role: "assistant",
-          content: data.message?.content || data.content || [],
-          stopReason: "stop",
-        },
+        // A model response can request more tools. It is not a turn boundary.
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: textFromContent(data.message?.content || data.content || []) },
       }, meta];
+    case "turn/end": {
+      const reason = String(data.reason || "stop").toLowerCase();
+      const stopReason = ["error", "failed", "failure"].some((value) => reason.includes(value))
+        ? "error"
+        : ["completed", "success", "stop", "end_turn"].some((value) => reason.includes(value)) ? "end_turn" : reason;
+      return [{ type: "message_end", message: { role: "assistant", content: [], stopReason } }, meta];
+    }
     default:
       return null;
   }
@@ -211,8 +215,8 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
     const sessionId = String(session?.id || "unknown");
     const buffer = turnBuffers.get(sessionId) || { tools: [], errors: [] };
     if (event.type === "tool/call" && event.data?.name) buffer.tools.push(event.data.name);
-    if (event.type === "tool/result" && event.data?.error) {
-      const error = event.data.error;
+    if (event.type === "tool/result" && (event.data?.error || event.data?.message?.error || event.data?.message?.isError)) {
+      const error = event.data.error || event.data.message.error || { code: "tool_failure" };
       buffer.errors.push({ errorType: error.code || error.name || "tool_failure", tool: buffer.tools.at(-1) || "tool" });
     }
     turnBuffers.set(sessionId, buffer);
@@ -226,7 +230,7 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
       if (callId) toolCalls.delete(`${sessionId}:${callId}`);
     }
     legacyBus.emit(mapped[0], mapped[1]);
-    if (event.type === "assistant/message") {
+    if (event.type === "turn/end") {
       observedTurns += 1;
       if (buffer.errors.length) {
         const target = sessionTarget(session);
@@ -246,6 +250,7 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
       turnBuffers.delete(sessionId);
       persist();
       refreshSkill();
+      try { evolveSkills({ dryRun: false }); } catch (error) { ctx.log.warn(`skill evolution skipped: ${error.message}`); }
     }
   }
 
@@ -304,6 +309,8 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
 
   function stop() {
     if (!started) return;
+    unobserve?.();
+    unobserve = null;
     observer.unsubscribe();
     persist();
     refreshSkill();
@@ -314,26 +321,29 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
     start();
     const disposers = [];
     if (typeof harnessCtx?.on === "function") {
-      disposers.push(harnessCtx.on("session/event", observeSessionEvent));
+      disposers.push(harnessCtx.on("session/event", observeSessionEvent, { global: true }));
       disposers.push(harnessCtx.on("agent/pre-step", async (payload, next) => {
         const decision = await next();
         if (!decision || decision.kind !== "enter") return decision;
         const messages = Array.isArray(decision.messages) ? decision.messages : [];
         const query = messages.map((message) => textFromContent(message?.content)).join(" ").slice(-2000);
-        const project = payload?.agent?.session?.header?.cwd ? path.basename(payload.agent.session.header.cwd) : null;
+        const project = payload?.agent?.session?.header?.cwd
+          ? inferScope({ sessionPath: payload.agent.session.header.cwd }).project
+          : null;
         const text = buildInjection(query, project);
         if (!text) return decision;
         return {
           kind: "enter",
           messages: [createUserMessage({ content: [{ type: "text", text }], source: { kind: "plugin", plugin: "runtime-self-learning-harness" } }), ...messages],
         };
-      }));
+      }, { global: true }));
     }
     if (typeof harnessCtx?.on === "function") {
       disposers.push(harnessCtx.on("agent/session-start", ({ agent }) => {
-        const text = buildInjection("", agent?.session?.header?.cwd ? path.basename(agent.session.header.cwd) : null);
+        const project = agent?.session?.header?.cwd ? inferScope({ sessionPath: agent.session.header.cwd }).project : null;
+        const text = buildInjection("", project);
         if (text) agent.inject(createUserMessage({ content: [{ type: "text", text }], source: { kind: "plugin", plugin: "runtime-self-learning-harness" } }));
-      }));
+      }, { global: true }));
     }
     unobserve = () => { for (const dispose of disposers) { try { dispose?.(); } catch {} } };
     return status();

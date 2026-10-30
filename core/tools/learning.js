@@ -28,6 +28,7 @@ export async function executeLearning(input = {}, ctx = {}) {
         runtime.observeSessionEvent(session, { type: "tool/result", data: { name: tool, message: { content: [{ type: "text", text: "ok" }] } } });
       }
       runtime.observeSessionEvent(session, { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: input.turn.resultText || "completed" }] } } });
+      runtime.observeSessionEvent(session, { type: "turn/end", data: { reason: "completed" } });
       return runtime.status();
     }
     case "inject": {

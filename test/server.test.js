@@ -99,6 +99,7 @@ test("native session events are observed automatically and pre-step receives sco
   event(session, { type: "tool/call", data: { callId: "call-1", name: "fs_read", arguments: "{}" } });
   event(session, { type: "tool/result", data: { callId: "call-1", message: { content: [{ type: "text", text: "ok" }] } } });
   event(session, { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: "done" }] } } });
+  event(session, { type: "turn/end", data: { reason: "completed" } });
 
   const decision = await handlers.get("agent/pre-step")({
     agent: { session }, messages: [{ role: "user", content: [{ type: "text", text: "remember this workflow" }] }],
@@ -125,9 +126,46 @@ test("repeated failed tool turns become a skill-evolution candidate", async () =
     event(session, { type: "tool/call", data: { callId: `call-${i}`, name: "shell_exec", arguments: "{}" } });
     event(session, { type: "tool/result", data: { callId: `call-${i}`, error: { code: "permission_denied", message: "blocked" }, message: { content: [] } } });
     event(session, { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: "failed" }] } } });
+    event(session, { type: "turn/end", data: { reason: "error" } });
   }
+  const automaticCandidates = JSON.parse(await fs.readFile(path.join(dataDir, "skill_candidates.json"), "utf8"));
+  assert.ok(automaticCandidates.candidates.length >= 1);
   const evolved = await registered.get("learning_skill_evolve").execute({ options: { dryRun: true, promotionThreshold: 3 } });
   assert.equal(evolved.ok, true);
   assert.ok(evolved.counts.promotableClusters >= 1);
   assert.ok(evolved.candidates.length >= 1);
+});
+
+test("turn boundaries, failure mapping, and per-agent project scope follow native DSH context", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "harness-contract-flow-"));
+  const handlers = new Map();
+  const registrations = new Map();
+  const registrationOptions = new Map();
+  const ctx = {
+    dataDir, pluginDir: dataDir,
+    log: { info() {}, warn() {}, error() {}, debug() {} },
+    on(name, listener, options) { handlers.set(name, listener); registrationOptions.set(name, options); return () => {}; },
+    tools: { register(tool) { registrations.set(tool.name, tool); return () => {}; } },
+  };
+  apply(ctx);
+  assert.equal(registrationOptions.get("session/event").global, true);
+
+  const session = { id: "contract-session", header: { cwd: path.join(dataDir, "projects", "alpha") } };
+  const event = handlers.get("session/event");
+  event(session, { type: "user/message", data: { message: { role: "user", content: [{ type: "text", text: "read the file" }] } } });
+  event(session, { type: "tool/call", data: { callId: "c1", name: "fs_read", arguments: "{}" } });
+  event(session, { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: "calling a tool" }] } } });
+  const beforeEnd = await registrations.get("learning_status").execute({});
+  assert.equal(beforeEnd.observedTurns, 0);
+  event(session, { type: "tool/result", data: { callId: "c1", error: { code: "permission_denied" }, message: { content: [], isError: true } } });
+  event(session, { type: "turn/end", data: { reason: "error" } });
+  const afterEnd = await registrations.get("learning_status").execute({});
+  assert.equal(afterEnd.observedTurns, 1);
+
+  const agentExec = { agent: { session: { header: { cwd: path.join(dataDir, "projects", "alpha") } } } };
+  await registrations.get("memory_upsert").execute({ id: "alpha-memory", memory: { type: "preference", desc: "Alpha only" } }, agentExec);
+  const alpha = await registrations.get("memory_list").execute({ limit: 20 }, agentExec);
+  const beta = await registrations.get("memory_list").execute({ limit: 20 }, { agent: { session: { header: { cwd: path.join(dataDir, "projects", "beta") } } } });
+  assert.equal(alpha.memories.some((item) => item.id === "alpha-memory"), true);
+  assert.equal(beta.memories.some((item) => item.id === "alpha-memory"), false);
 });
