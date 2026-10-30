@@ -26,6 +26,7 @@ function paths(dataDir) {
     ACTIVITY_LOG: path.join(dataDir, "activity_log.jsonl"),
     HISTORY_DIR: path.join(dataDir, "skill_history"),
     GENERATED_SKILL: path.join(dataDir, "generated", "skills", "self-learning", "SKILL.md"),
+    REFLEXION_FILE: path.join(dataDir, "reflexion_memory.jsonl"),
   };
 }
 
@@ -145,6 +146,7 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
   let injectedTurns = 0;
   let unobserve = null;
   const toolCalls = new Map();
+  const turnBuffers = new Map();
 
   const persist = () => {
     writeJson(p.PATTERNS_FILE, [...detector.patterns.values()]);
@@ -207,6 +209,13 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
     const mapped = mapSessionEvent(session, event);
     if (!mapped) return;
     const sessionId = String(session?.id || "unknown");
+    const buffer = turnBuffers.get(sessionId) || { tools: [], errors: [] };
+    if (event.type === "tool/call" && event.data?.name) buffer.tools.push(event.data.name);
+    if (event.type === "tool/result" && event.data?.error) {
+      const error = event.data.error;
+      buffer.errors.push({ errorType: error.code || error.name || "tool_failure", tool: buffer.tools.at(-1) || "tool" });
+    }
+    turnBuffers.set(sessionId, buffer);
     if (event.type === "tool/call" && event.data?.callId) {
       toolCalls.set(`${sessionId}:${event.data.callId}`, event.data.name || "tool");
     }
@@ -219,6 +228,22 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
     legacyBus.emit(mapped[0], mapped[1]);
     if (event.type === "assistant/message") {
       observedTurns += 1;
+      if (buffer.errors.length) {
+        const target = sessionTarget(session);
+        const project = inferScope({ sessionPath: target.sessionPath }).project;
+        for (const failure of buffer.errors) appendJsonl(p.REFLEXION_FILE, {
+          id: `reflexion:${sessionId}:${Date.now()}:${failure.tool}`,
+          taskType: "general",
+          actionType: failure.tool,
+          errorType: failure.errorType,
+          rootCause: "tool returned an error during the observed task",
+          failure: { errorType: failure.errorType, tool: failure.tool },
+          futureStrategy: { beforePatch: [`inspect ${failure.tool} inputs and preconditions`], afterPatch: ["run the verification step again"] },
+          scope: { project },
+          createdAt: new Date().toISOString(),
+        });
+      }
+      turnBuffers.delete(sessionId);
       persist();
       refreshSkill();
     }

@@ -107,3 +107,27 @@ test("native session events are observed automatically and pre-step receives sco
   assert.equal(decision.messages.length, 2);
   assert.match(decision.messages[0].content[0].text, /verified workflow/i);
 });
+
+test("repeated failed tool turns become a skill-evolution candidate", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "harness-skill-flow-"));
+  const handlers = new Map();
+  const registered = new Map();
+  const ctx = {
+    dataDir, pluginDir: dataDir,
+    log: { info() {}, warn() {}, error() {}, debug() {} },
+    on(name, listener) { handlers.set(name, listener); return () => handlers.delete(name); },
+    tools: { register(tool) { registered.set(tool.name, tool); return () => {}; } },
+  };
+  apply(ctx);
+  const event = handlers.get("session/event");
+  for (let i = 0; i < 3; i += 1) {
+    const session = { id: `failed-session-${i}`, header: { cwd: path.join(dataDir, "projects", "skill") } };
+    event(session, { type: "tool/call", data: { callId: `call-${i}`, name: "shell_exec", arguments: "{}" } });
+    event(session, { type: "tool/result", data: { callId: `call-${i}`, error: { code: "permission_denied", message: "blocked" }, message: { content: [] } } });
+    event(session, { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: "failed" }] } } });
+  }
+  const evolved = await registered.get("learning_skill_evolve").execute({ options: { dryRun: true, promotionThreshold: 3 } });
+  assert.equal(evolved.ok, true);
+  assert.ok(evolved.counts.promotableClusters >= 1);
+  assert.ok(evolved.candidates.length >= 1);
+});
