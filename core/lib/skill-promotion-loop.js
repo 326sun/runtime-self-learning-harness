@@ -138,6 +138,12 @@ export function runSkillPromotionLoop(learnerDir, options = {}) {
     if (transitioned.candidate.status === "active") {
       activeRegistry = upsertActiveSkill(activeRegistry, transitioned.candidate);
       events.push({ type: "active_skill.registered", candidateId: transitioned.candidate.id });
+    } else if (activeRegistry.skills.some((skill) => skill.id === transitioned.candidate.id)) {
+      activeRegistry = {
+        ...activeRegistry,
+        skills: activeRegistry.skills.filter((skill) => skill.id !== transitioned.candidate.id),
+      };
+      events.push({ type: "active_skill.removed", candidateId: transitioned.candidate.id, reason: transitioned.reason });
     }
     if (transitioned.candidate.status !== "removed") nextCandidates.push(transitioned.candidate);
     else events.push({ type: "candidate.removed", candidateId: transitioned.candidate.id });

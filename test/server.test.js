@@ -72,6 +72,7 @@ test("native Harness bundle registers memory, observation, injection, and skill-
   } });
   const status = await registered.get("learning_status").execute({});
   assert.equal(status.observedTurns, 1);
+  assert.equal(status.autoActionsEnabled, false);
   assert.ok(status.patterns >= 0);
 
   const injection = await registered.get("learning_inject").execute({ query: "verified workflow" });
@@ -93,7 +94,7 @@ test("native session events are observed automatically and pre-step receives sco
   };
   apply(ctx);
   const session = { id: "session-auto", header: { cwd: path.join(dataDir, "projects", "auto") } };
-  await registered.get("memory_upsert").execute({ id: "auto-memory", memory: { type: "preference", desc: "Remember the verified workflow" } });
+  await registered.get("memory_upsert").execute({ id: "auto-memory", memory: { type: "preference", desc: "Remember the verified workflow" } }, { agent: { session: { header: { cwd: path.join(dataDir, "projects", "auto") } } } });
   const event = handlers.get("session/event");
   event(session, { type: "user/message", data: { message: { role: "user", content: [{ type: "text", text: "remember this workflow" }] } } });
   event(session, { type: "tool/call", data: { callId: "call-1", name: "fs_read", arguments: "{}" } });
@@ -103,10 +104,12 @@ test("native session events are observed automatically and pre-step receives sco
 
   const decision = await handlers.get("agent/pre-step")({
     agent: { session }, messages: [{ role: "user", content: [{ type: "text", text: "remember this workflow" }] }],
-  }, async () => ({ kind: "enter", messages: [{ role: "user", content: [{ type: "text", text: "remember this workflow" }] }] }));
+  }, async () => ({ kind: "enter", startsRequestSeries: true, messages: [{ role: "user", content: [{ type: "text", text: "remember this workflow" }] }] }));
   assert.equal(decision.kind, "enter");
   assert.equal(decision.messages.length, 2);
   assert.match(decision.messages[0].content[0].text, /verified workflow/i);
+  assert.equal(decision.messages[0].source.kind, "plugin");
+  assert.equal(decision.startsRequestSeries, true);
 });
 
 test("repeated failed tool turns become a skill-evolution candidate", async () => {
@@ -134,6 +137,25 @@ test("repeated failed tool turns become a skill-evolution candidate", async () =
   assert.equal(evolved.ok, true);
   assert.ok(evolved.counts.promotableClusters >= 1);
   assert.ok(evolved.candidates.length >= 1);
+
+  const completeTurn = (id, failed = false) => {
+    const session = { id, header: { cwd: path.join(dataDir, "projects", "skill") } };
+    event(session, { type: "tool/call", data: { callId: `${id}-call`, name: "shell_exec", arguments: "{}" } });
+    event(session, failed
+      ? { type: "tool/result", data: { callId: `${id}-call`, error: { code: "permission_denied" }, message: { content: [], isError: true } } }
+      : { type: "tool/result", data: { callId: `${id}-call`, message: { content: [{ type: "text", text: "ok" }] } } });
+    event(session, { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: failed ? "failed" : "fixed" }] } } });
+    event(session, { type: "turn/end", data: { reason: failed ? "error" : "completed" } });
+  };
+  completeTurn("success-1");
+  completeTurn("success-2");
+  await registered.get("learning_skill_evolve").execute({ options: { minSuccess: 1, activeSuccess: 2 } });
+  const active = await registered.get("learning_skill_evolve").execute({ options: { minSuccess: 1, activeSuccess: 2 } });
+  assert.ok(active.activeSkills.some((skill) => skill.id.includes("shell_exec")));
+  completeTurn("regression-1", true);
+  const regressed = await registered.get("learning_skill_evolve").execute({ options: { minSuccess: 1, activeSuccess: 2 } });
+  assert.equal(regressed.activeSkills.some((skill) => skill.id.includes("shell_exec")), false);
+  assert.ok(regressed.candidates.some((candidate) => candidate.status === "decayed"));
 });
 
 test("turn boundaries, failure mapping, and per-agent project scope follow native DSH context", async () => {
@@ -149,6 +171,8 @@ test("turn boundaries, failure mapping, and per-agent project scope follow nativ
   };
   apply(ctx);
   assert.equal(registrationOptions.get("session/event").global, true);
+  assert.equal(registrationOptions.get("agent/created").global, true);
+  assert.equal(handlers.has("agent/session-start"), false);
 
   const session = { id: "contract-session", header: { cwd: path.join(dataDir, "projects", "alpha") } };
   const event = handlers.get("session/event");

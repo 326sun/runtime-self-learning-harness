@@ -5,12 +5,14 @@ import { PatternDetector } from "./pattern-detector.js";
 import { createObserver } from "./observer.js";
 import { runSkillPromotionLoop } from "./skill-promotion-loop.js";
 import { buildSkillMdFromPatterns } from "./skill-renderer-safe.js";
+import { buildLongMemoryHint } from "./long-memory-retrieval.js";
+import { recordActionFeedback } from "./action-runtime.js";
+import { loadSkillCandidates } from "./skill-promotion-store.js";
 import { DEFAULT_CONFIG, loadLearnerConfig, readJson, writeJson } from "./common.js";
 import { runtimeConfigPath } from "./runtime-config-path.js";
 import { normalizeSessionTarget } from "./helpers.js";
-import { inferScope, memoryScopeVisible } from "./scope.js";
+import { inferScope } from "./scope.js";
 import { readEffectiveMemories } from "./managed-memory-store.js";
-import { memoryTier } from "./memory-relations.js";
 
 const MAX_SESSIONS = 64;
 
@@ -132,7 +134,15 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
   ensurePaths(p);
   const ctx = createRuntimeContext(p.DATA_DIR, pluginDir || p.DATA_DIR, log);
   const loaded = loadLearnerConfig(p.CONFIG_FILE, { persist: true });
-  const config = { ...DEFAULT_CONFIG, ...loaded };
+  const config = {
+    ...DEFAULT_CONFIG,
+    ...loaded,
+    autoActions: { ...(DEFAULT_CONFIG.autoActions || {}), ...(loaded.autoActions || {}), enabled: false },
+  };
+  // The copied observer reloads runtime-config.json at turn boundaries. Persist
+  // the Harness safety override so that a user config with autoActions.enabled
+  // true cannot silently re-enable the App-oriented action pipeline.
+  writeJson(p.CONFIG_FILE, config);
   const detector = new PatternDetector(config);
   try { detector.restore(readJson(p.PATTERNS_FILE, [])); } catch { detector.restore([]); }
   const legacyBus = createLegacyBus();
@@ -247,6 +257,20 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
           createdAt: new Date().toISOString(),
         });
       }
+      const candidateStore = loadSkillCandidates(p.DATA_DIR);
+      const candidateByAction = new Map(candidateStore.candidates.map((candidate) => [candidate.actionType, candidate]));
+      const effective = buffer.errors.length === 0;
+      for (const tool of [...new Set(buffer.tools)]) {
+        const candidate = candidateByAction.get(tool);
+        const judgedRegression = !effective && ["staged", "active", "measured"].includes(candidate?.status);
+        recordActionFeedback(p.DATA_DIR, {
+          actionId: `observed-turn:${sessionId}:${Date.now()}:${tool}`,
+          actionType: tool,
+          taskType: "general",
+          ...(effective ? { effective: true, success: true } : judgedRegression ? { effective: false, regression: true, errorType: buffer.errors[0]?.errorType || "tool_failure" } : {}),
+          reason: effective ? "observed turn completed without tool errors" : "observed tool failure",
+        });
+      }
       turnBuffers.delete(sessionId);
       persist();
       refreshSkill();
@@ -256,25 +280,16 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
 
   function buildInjection(query, project) {
     const scope = inferScope({ project, sessionPath: project ? `projects/${project}` : null });
-    const matches = detector.all().filter((item) => item.injectable && (!scope.project || item.context?.project === scope.project || item.project === scope.project || item.context?.project === "general"));
-    const terms = String(query || "").trim().toLowerCase();
-    const queryTokens = terms.split(/\s+/).filter((token) => token.length >= 2);
-    const ranked = matches.sort((a, b) => {
-      const aHit = terms && JSON.stringify(a).toLowerCase().includes(terms) ? 1 : 0;
-      const bHit = terms && JSON.stringify(b).toLowerCase().includes(terms) ? 1 : 0;
-      return bHit - aHit || Number(b.score || 0) - Number(a.score || 0);
-    }).slice(0, 8);
-    const managed = readEffectiveMemories(p.DATA_DIR)
-      .filter((item) => item.status === "approved" && memoryTier(item) === "core" && memoryScopeVisible(item.scope || item.context, scope.project))
-      .filter((item) => !queryTokens.length || queryTokens.some((token) => JSON.stringify(item).toLowerCase().includes(token)))
-      .slice(0, 8);
-    if (!ranked.length && !managed.length) return null;
-    const lines = [
-      ...ranked.map((item) => `- [pattern] ${item.fix || item.desc || item.summary || item.id}`),
-      ...managed.map((item) => `- [memory] ${item.desc || item.summary || item.object || item.id}`),
-    ];
+    const hint = buildLongMemoryHint(readEffectiveMemories(p.DATA_DIR), query || "current task", {
+      config,
+      project: scope.project,
+      memoryLayer: "core",
+      limit: 8,
+      maxTokens: config.maxSkillTokens,
+    });
+    if (!hint) return null;
     injectedTurns += 1;
-    return `Runtime Self-Learning memory for this turn:\n${lines.join("\n")}\nTreat these as scoped suggestions; verify them against the current request.`;
+    return `${hint}\nTreat these as scoped suggestions; verify them against the current request.`;
   }
 
   function evolveSkills(options = {}) {
@@ -291,6 +306,7 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
       dataDir: p.DATA_DIR,
       observedTurns,
       injectedTurns,
+      autoActionsEnabled: config.autoActions?.enabled === true,
       patterns: detector.all().length,
       injectablePatterns: detector.all().filter((item) => item.injectable).length,
       skillCandidates: (() => { try { return readJson(path.join(p.DATA_DIR, "skill_candidates.json"), { candidates: [] }).candidates.length; } catch { return 0; } })(),
@@ -333,13 +349,14 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
         const text = buildInjection(query, project);
         if (!text) return decision;
         return {
+          ...decision,
           kind: "enter",
           messages: [createUserMessage({ content: [{ type: "text", text }], source: { kind: "plugin", plugin: "runtime-self-learning-harness" } }), ...messages],
         };
       }, { global: true }));
     }
     if (typeof harnessCtx?.on === "function") {
-      disposers.push(harnessCtx.on("agent/session-start", ({ agent }) => {
+      disposers.push(harnessCtx.on("agent/created", ({ agent }) => {
         const project = agent?.session?.header?.cwd ? inferScope({ sessionPath: agent.session.header.cwd }).project : null;
         const text = buildInjection("", project);
         if (text) agent.inject(createUserMessage({ content: [{ type: "text", text }], source: { kind: "plugin", plugin: "runtime-self-learning-harness" } }));
