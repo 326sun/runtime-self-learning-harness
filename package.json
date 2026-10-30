@@ -1,6 +1,6 @@
 {
   "name": "runtime-self-learning-harness",
-  "version": "6.2.7",
+  "version": "6.2.8",
   "description": "Standalone DeepSeek Harness MCP plugin for Runtime Self-Learning 6.2",
   "type": "module",
   "main": "index.js",
@@ -10,11 +10,13 @@
     "core/",
     "server.js",
     "README.md",
+    "docs/",
     "LICENSE"
   ],
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "check:package": "node scripts/verify-package.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",

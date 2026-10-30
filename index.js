@@ -22,8 +22,10 @@ function context(overrides = {}) {
 }
 
 function executionContext(exec, owner) {
-  const sessionPath = exec?.agent?.session?.header?.cwd || null;
-  return context({ dataDir: owner?.dataDir, pluginDir: owner?.pluginDir, sessionPath, owner, log: owner?.log });
+  const session = exec?.agent?.session;
+  const sessionPath = session?.header?.cwd || null;
+  const sessionId = session?.id == null ? null : String(session.id);
+  return context({ dataDir: owner?.dataDir, pluginDir: owner?.pluginDir, sessionPath, sessionId, owner, log: owner?.log });
 }
 
 async function runMemory(input, exec, owner) {
@@ -124,8 +126,12 @@ export function apply(ctx) {
   registerLearning(ctx, "learning_skill_evolve", "Run the review-gated skill evolution loop and refresh the generated self-learning skill.",
     { options: { type: "object", additionalProperties: true } },
     (args) => ({ action: "evolve", ...args }));
-  registerLearning(ctx, "learning_skill_feedback", "Record verified success or regression for one skill candidate and run the promotion loop.",
-    { candidateId: { type: "string", required: true }, outcome: { type: "string", enum: ["success", "regression"], required: true }, verification: { type: "object", required: true, additionalProperties: true } },
+  registerLearning(ctx, "learning_skill_feedback", "Begin a skill trial before executing the host-configured strategy and verification, or complete it from observed session events. Does not execute commands. A verified boolean is not accepted as evidence.",
+    {
+      candidateId: { type: "string", required: true },
+      phase: { type: "string", enum: ["begin", "complete"], required: true },
+      trialId: { type: "string", description: "Required for complete; returned by begin in this session turn." },
+    },
     (args) => ({ action: "feedback", ...args }));
   registerLearning(ctx, "learning_skill_render", "Render the current learned patterns and active skills to the local generated skill file.",
     { }, (args) => ({ action: "render_skill", ...args }));

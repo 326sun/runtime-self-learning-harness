@@ -1,4 +1,5 @@
 import { nowIso } from "./skill-promotion-store.js";
+import { SKILL_EVIDENCE_VERSION, SKILL_VERIFICATION_SOURCE, hasSkillVerificationReceipt, skillRuleDigest } from "./skill-feedback-verifier.js";
 
 function updateSkillEvidence(candidate, row) {
   const evidence = candidate.evidence || {};
@@ -9,9 +10,13 @@ function updateSkillEvidence(candidate, row) {
     ...candidate,
     evidence: {
       ...evidence,
+      verificationVersion: SKILL_EVIDENCE_VERSION,
       successCount: (evidence.successCount || 0) + (effective ? 1 : 0),
       regressionCount: (evidence.regressionCount || 0) + (regressed ? 1 : 0),
       failureCount: (evidence.failureCount || 0) + (regressed ? 1 : 0),
+      shownCount: (evidence.shownCount || 0) + (row.displayed === true ? 1 : 0),
+      appliedCount: (evidence.appliedCount || 0) + (row.strategyApplied === true ? 1 : 0),
+      verifiedCount: (evidence.verifiedCount || 0) + (verified ? 1 : 0),
     },
   };
 }
@@ -63,28 +68,33 @@ function candidateErrorType(candidate = {}) {
   return candidate.errorType || candidate.evidence?.errorType || candidate.sourceErrorType || String(candidate.rule || "").match(/Before ([^ ]+) repair/)?.[1] || null;
 }
 
-function feedbackMatchesCandidate(candidate = {}, row = {}) {
-  if (row.skillCandidateId === candidate.id || row.candidateId === candidate.id) {
-    return row.verification?.verified === true && row.strategyApplied === true;
-  }
+function feedbackMatchesCandidate(candidate = {}, row = {}, receipts) {
+  if (row.skillCandidateId !== candidate.id) return false;
   if (row.strategyApplied !== true || row.verification?.verified !== true) return false;
+  if (row.verification?.source !== SKILL_VERIFICATION_SOURCE) return false;
+  if (row.verification.ruleSha256 !== skillRuleDigest(candidate.rule)) return false;
+  if (row.executionEvidence?.source !== SKILL_VERIFICATION_SOURCE || !hasSkillVerificationReceipt(row, receipts)) return false;
+  if (!row.executionEvidence?.strategyCallId || !row.executionEvidence?.verificationCallId) return false;
+  if (row.executionEvidence.strategyCallId === row.executionEvidence.verificationCallId) return false;
   const scopeTaskTypes = Array.isArray(candidate.scope?.taskTypes) ? candidate.scope.taskTypes : [];
   const taskTypeMatches = !row.taskType || scopeTaskTypes.length === 0 || scopeTaskTypes.includes(row.taskType);
   const errorType = candidateErrorType(candidate);
-  const errorMatches = !row.errorType || !errorType || row.errorType === errorType;
-  const actionTypeMatches = !row.actionType || !candidate.actionType || row.actionType === candidate.actionType;
   const candidateProject = candidate.scope?.project || "general";
-  const rowProject = row.scope?.project || "general";
-  const projectMatches = candidateProject === "general" || rowProject === "general" || candidateProject === rowProject;
-  return taskTypeMatches && errorMatches && actionTypeMatches && projectMatches && (row.effective === true || row.effective === false || row.success === true || row.regression === true);
+  const rowProject = row.scope?.project;
+  const projectMatches = typeof rowProject === "string" && candidateProject === rowProject
+    && row.executionEvidence.project === candidateProject;
+  const errorMatches = row.errorType === errorType;
+  const actionTypeMatches = row.actionType === candidate.actionType;
+  return taskTypeMatches && errorMatches && actionTypeMatches && projectMatches
+    && (row.effective === true || row.effective === false || row.success === true || row.regression === true);
 }
 
-export function absorbFeedback(candidate = {}, feedbackRows = []) {
+export function absorbFeedback(candidate = {}, feedbackRows = [], receipts = new Map()) {
   let next = candidate;
   const seen = new Set(candidate.evidence?.feedbackIds || []);
   let consumed = 0;
   for (const row of feedbackRows) {
-    if (!feedbackMatchesCandidate(next, row)) continue;
+    if (!feedbackMatchesCandidate(next, row, receipts)) continue;
     const key = feedbackKey(row);
     if (!key || seen.has(key)) continue;
     next = updateSkillEvidence(next, row);
@@ -134,6 +144,7 @@ export function upsertActiveSkill(registry, candidate) {
   const skills = [...(registry.skills || [])];
   const skill = {
     id: candidate.id,
+    identityVersion: candidate.identityVersion,
     rule: candidate.rule,
     scope: candidate.scope,
     evidence: candidate.evidence,

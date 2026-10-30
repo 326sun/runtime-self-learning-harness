@@ -15,6 +15,7 @@ import { runtimeConfigPath } from "./runtime-config-path.js";
 import { normalizeSessionTarget } from "./helpers.js";
 import { inferScope } from "./scope.js";
 import { readEffectiveMemories } from "./managed-memory-store.js";
+import { beginSkillTrial, completeSkillTrial } from "./skill-feedback-verifier.js";
 
 const MAX_SESSIONS = 64;
 
@@ -51,6 +52,45 @@ function textFromContent(content = []) {
   return Array.isArray(content) ? content.map((part) => part?.text || "").join(" ") : "";
 }
 
+function createTurnBuffer() {
+  return { errors: [], injectedSkillIds: [], executions: [], sequence: 0 };
+}
+
+function toolResultCallId(data = {}) {
+  const message = data.message || {};
+  const resultBlock = Array.isArray(message.content)
+    ? message.content.find((block) => block?.type === "tool-result")
+    : null;
+  return data.callId || message.source?.callId || resultBlock?.toolCallId || null;
+}
+
+function toolResultError(data = {}) {
+  const message = data.message || {};
+  const resultBlocks = Array.isArray(message.content)
+    ? message.content.filter((block) => block?.type === "tool-result")
+    : [];
+  const failedBlock = resultBlocks.find((block) => block.isError === true);
+  if (!data.error && !message.error && message.isError !== true && !failedBlock) return null;
+  return data.error || message.error || failedBlock?.error || { code: "tool_failure" };
+}
+
+function isNativeToolResult(data = {}, callId) {
+  const message = data.message;
+  const block = message?.content?.[0];
+  return Boolean(message?.source?.kind === "tool" && message.source.callId === callId
+    && message.content.length === 1 && block?.type === "tool-result"
+    && block.toolCallId === callId && Array.isArray(block.content) && typeof block.isError === "boolean");
+}
+
+function toolResultText(message = {}) {
+  const blocks = Array.isArray(message.content) ? message.content : [];
+  const resultBlocks = blocks.filter((block) => block?.type === "tool-result");
+  const content = resultBlocks.length
+    ? resultBlocks.flatMap((block) => Array.isArray(block.content) ? block.content : [])
+    : blocks;
+  return textFromContent(content);
+}
+
 function sessionTarget(session) {
   const header = session?.header || {};
   return normalizeSessionTarget({
@@ -84,8 +124,11 @@ function mapSessionEvent(session, event) {
   const meta = sessionMeta(session);
   const data = event?.data || {};
   switch (event?.type) {
-    case "user/message":
-      return [{ type: "user_message", message: data.message || data }, meta];
+    case "user/message": {
+      const message = data.message || data;
+      if (message.source?.kind && message.source.kind !== "user") return null;
+      return [{ type: "user_message", message }, meta];
+    }
     case "tool/call":
       return [{ type: "tool_execution_start", toolName: data.name, name: data.name, args: data.arguments }, meta];
     case "tool/result": {
@@ -95,8 +138,8 @@ function mapSessionEvent(session, event) {
         toolName: data.name || data.toolName || message.name || "tool",
         name: data.name || data.toolName || message.name || "tool",
         result: message,
-        isError: Boolean(data.error || message.error || message.isError),
-        error: data.error || message.error,
+        isError: Boolean(toolResultError(data)),
+        error: toolResultError(data),
       }, meta];
     }
     case "assistant/message":
@@ -162,8 +205,19 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
   let observedTurns = 0;
   let injectedTurns = 0;
   let unobserve = null;
-  const toolCalls = new Map();
   const turnBuffers = new Map();
+  const agentSessionIds = new Map();
+
+  function sessionIdForAgent(agent) {
+    if (!agent || typeof agent !== "object") return null;
+    const agentId = agent.id == null ? null : String(agent.id);
+    const sessionId = agent.session?.id ?? agent.session?.header?.id;
+    if (agentId && sessionId != null) {
+      agentSessionIds.set(agentId, String(sessionId));
+      while (agentSessionIds.size > MAX_SESSIONS) agentSessionIds.delete(agentSessionIds.keys().next().value);
+    }
+    return sessionId != null ? String(sessionId) : agentId ? agentSessionIds.get(agentId) || null : null;
+  }
 
   const persist = () => {
     writeJson(p.PATTERNS_FILE, [...detector.patterns.values()]);
@@ -226,22 +280,38 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
     const mapped = mapSessionEvent(session, event);
     if (!mapped) return;
     const sessionId = String(session?.id || "unknown");
-    const buffer = turnBuffers.get(sessionId) || { tools: [], errors: [], injectedSkillIds: [] };
-    if (event.type === "tool/call" && event.data?.name) buffer.tools.push(event.data.name);
-    if (event.type === "tool/result" && (event.data?.error || event.data?.message?.error || event.data?.message?.isError)) {
-      const error = event.data.error || event.data.message.error || { code: "tool_failure" };
-      buffer.errors.push({ errorType: error.code || error.name || "tool_failure", tool: buffer.tools.at(-1) || "tool" });
-    }
-    turnBuffers.set(sessionId, buffer);
-    if (event.type === "tool/call" && event.data?.callId) {
-      toolCalls.set(`${sessionId}:${event.data.callId}`, event.data.name || "tool");
+    const buffer = turnBuffers.get(sessionId) || createTurnBuffer();
+    if (event.type === "tool/call") {
+      buffer.sequence += 1;
+      buffer.executions.push({
+        callId: event.data?.callId == null ? null : String(event.data.callId),
+        toolName: event.data?.name || "tool",
+        arguments: event.data?.arguments || "",
+        order: buffer.sequence,
+        completed: false,
+      });
     }
     if (event.type === "tool/result") {
-      const callId = event.data?.callId;
-      const toolName = toolCalls.get(`${sessionId}:${callId}`);
-      if (toolName) mapped[0].toolName = toolName;
-      if (callId) toolCalls.delete(`${sessionId}:${callId}`);
+      const callId = toolResultCallId(event.data);
+      const execution = callId == null ? null : buffer.executions.findLast((item) => item.callId === String(callId));
+      const error = toolResultError(event.data);
+      if (execution && !execution.completed) {
+        buffer.sequence += 1;
+        execution.completed = true;
+        execution.resultOrder = buffer.sequence;
+        execution.error = error;
+        execution.nativeResult = isNativeToolResult(event.data, callId);
+        execution.resultText = toolResultText(event.data?.message);
+        mapped[0].toolName = execution.toolName;
+      }
+      if (error) {
+        buffer.errors.push({
+          errorType: error.code || error.name || "tool_failure",
+          tool: execution?.toolName || event.data?.name || "tool",
+        });
+      }
     }
+    turnBuffers.set(sessionId, buffer);
     legacyBus.emit(mapped[0], mapped[1]);
     if (event.type === "turn/end") {
       observedTurns += 1;
@@ -260,26 +330,6 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
           createdAt: new Date().toISOString(),
         });
       }
-      const effective = buffer.errors.length === 0;
-      const candidateStore = loadSkillCandidates(p.DATA_DIR);
-      const candidatesById = new Map(candidateStore.candidates.map((candidate) => [candidate.id, candidate]));
-      for (const candidateId of buffer.injectedSkillIds || []) {
-        const candidate = candidatesById.get(candidateId);
-        if (!candidate || !buffer.tools.includes(candidate.actionType)) continue;
-        recordActionFeedback(p.DATA_DIR, {
-          actionId: `observed-skill:${sessionId}:${Date.now()}:${candidate.id}`,
-          skillCandidateId: candidate.id,
-          candidateId: candidate.id,
-          actionType: candidate.actionType,
-          errorType: candidate.errorType,
-          scope: candidate.scope,
-          taskType: "general",
-          strategyApplied: true,
-          verification: { verified: true, source: "native-turn-observation" },
-          ...(effective ? { effective: true, success: true } : { effective: false, regression: true, errorType: buffer.errors[0]?.errorType || candidate.errorType || "tool_failure" }),
-          reason: effective ? "injected skill strategy completed without tool errors" : "injected skill strategy regressed during observed turn",
-        });
-      }
       turnBuffers.delete(sessionId);
       persist();
       refreshSkill();
@@ -296,51 +346,54 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
       limit: 8,
       maxTokens: config.maxSkillTokens,
     });
-    const skills = selectInjectableActiveSkills(p.DATA_DIR, config)
-      .filter((skill) => {
-        const skillProject = skill.scope?.project || "general";
-        return skillProject === "general" || skillProject === "global" || skillProject === scope.project;
-      });
-    const skillLines = skills.map((skill) => `- [active-skill:${skill.id}] ${String(skill.rule).replace(/\s+/g, " ").trim().slice(0, 240)}`);
-    if (!hint && !skillLines.length) return null;
-    let text = hint || "ACTIVE_VALIDATED_SKILLS:";
-    for (const line of skillLines) {
-      const candidate = `${text}\nACTIVE_VALIDATED_SKILLS:\n${line}`;
-      if (estimateTokens(candidate) > Number(config.maxSkillTokens || DEFAULT_CONFIG.maxSkillTokens)) break;
-      text = candidate;
+    const skills = selectInjectableActiveSkills(p.DATA_DIR, config, { project: scope.project });
+    const suffix = "\nTreat these as scoped suggestions; verify them against the current request.";
+    let text = hint || "";
+    let skillHeaderAdded = false;
+    for (const skill of skills) {
+      const line = `- [active-skill:${skill.id}] ${String(skill.rule).replace(/\s+/g, " ").trim().slice(0, 240)}`;
+      const proposed = `${text}${skillHeaderAdded ? "" : "\nACTIVE_VALIDATED_SKILLS:"}\n${line}`;
+      if (estimateTokens(`${proposed}${suffix}`) > Number(config.maxSkillTokens || DEFAULT_CONFIG.maxSkillTokens)) continue;
+      text = proposed;
+      skillHeaderAdded = true;
       if (sessionId) {
-        const buffer = turnBuffers.get(String(sessionId)) || { tools: [], errors: [], injectedSkillIds: [] };
-        buffer.injectedSkillIds = [...new Set([...(buffer.injectedSkillIds || []), skills[skillLines.indexOf(line)].id])];
+        const buffer = turnBuffers.get(String(sessionId)) || createTurnBuffer();
+        buffer.injectedSkillIds = [...new Set([...buffer.injectedSkillIds, skill.id])];
         turnBuffers.set(String(sessionId), buffer);
+        logActivity({ type: "skill.shown", candidateId: skill.id });
       }
     }
+    if (!text) return null;
     injectedTurns += 1;
-    return `${text}\nTreat these as scoped suggestions; verify them against the current request.`;
+    return `${text}${suffix}`;
   }
 
-  function recordSkillFeedback(candidateId, outcome, verification = {}) {
+  function recordSkillFeedback(input = {}, executionContext = {}) {
+    const { candidateId, phase, trialId } = input;
     const candidate = loadSkillCandidates(p.DATA_DIR).candidates.find((item) => item.id === candidateId);
     if (!candidate) throw new Error(`skill candidate not found: ${candidateId}`);
-    if (verification?.verified !== true) throw new Error("skill feedback requires verification.verified=true");
-    const success = outcome === "success";
-    const regression = outcome === "regression";
-    if (!success && !regression) throw new Error("outcome must be success or regression");
-    recordActionFeedback(p.DATA_DIR, {
-      actionId: `explicit-skill-feedback:${candidateId}:${Date.now()}`,
-      skillCandidateId: candidate.id,
-      candidateId: candidate.id,
-      actionType: candidate.actionType,
-      errorType: candidate.errorType,
-      scope: candidate.scope,
-      taskType: "general",
-      strategyApplied: true,
-      verification,
-      effective: success,
-      success,
-      regression,
-      reason: verification.reason || "explicit verified skill feedback",
-    });
-    return evolveSkills({ dryRun: false });
+    const sessionId = executionContext.sessionId;
+    if (typeof sessionId !== "string" || !sessionId) {
+      throw new Error("skill feedback requires the active Harness session execution evidence");
+    }
+    const project = inferScope({ sessionPath: executionContext.sessionPath }).project;
+    if (project !== (candidate.scope?.project || "general")) throw new Error("skill feedback project does not match the candidate scope");
+    const buffer = turnBuffers.get(sessionId) || createTurnBuffer();
+    if (phase === "begin") {
+      if (candidate.status === "active" && !buffer.injectedSkillIds.includes(candidate.id)) {
+        throw new Error("active skill feedback requires the candidate to have been injected in this session");
+      }
+      const result = beginSkillTrial(p.DATA_DIR, candidate, buffer, { sessionId, project });
+      turnBuffers.set(sessionId, buffer);
+      logActivity({ type: "skill_trial.shown", candidateId, trialId: result.trialId });
+      return result;
+    }
+    if (phase !== "complete") throw new Error("skill feedback phase must be begin or complete");
+    const row = completeSkillTrial(p.DATA_DIR, candidate, buffer, { sessionId, project, trialId });
+    const recorded = recordActionFeedback(p.DATA_DIR, row);
+    if (!recorded.ok) throw new Error(recorded.error || "skill feedback could not be recorded");
+    logActivity({ type: "skill_trial.verified", candidateId, trialId: row.feedbackId, success: row.success });
+    return { ...evolveSkills({ dryRun: false }), outcome: row.success ? "success" : "regression", trialId: row.feedbackId };
   }
 
   function evolveSkills(options = {}) {
@@ -379,6 +432,8 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
     unobserve?.();
     unobserve = null;
     observer.unsubscribe();
+    turnBuffers.clear();
+    agentSessionIds.clear();
     persist();
     refreshSkill();
     started = false;
@@ -397,7 +452,7 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
         const project = payload?.agent?.session?.header?.cwd
           ? inferScope({ sessionPath: payload.agent.session.header.cwd }).project
           : null;
-        const text = buildInjection(query, project, payload?.agent?.id || payload?.agent?.session?.id);
+        const text = buildInjection(query, project, sessionIdForAgent(payload?.agent));
         if (!text) return decision;
         return {
           ...decision,
@@ -409,7 +464,7 @@ export function createHarnessRuntime({ dataDir, pluginDir, log } = {}) {
     if (typeof harnessCtx?.on === "function") {
       disposers.push(harnessCtx.on("agent/created", ({ agent }) => {
         const project = agent?.session?.header?.cwd ? inferScope({ sessionPath: agent.session.header.cwd }).project : null;
-        const text = buildInjection("", project, agent?.id || agent?.session?.id);
+        const text = buildInjection("", project, sessionIdForAgent(agent));
         if (text) agent.inject(createUserMessage({ content: [{ type: "text", text }], source: { kind: "plugin", plugin: "runtime-self-learning-harness" } }));
       }, { global: true }));
     }

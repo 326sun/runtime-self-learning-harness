@@ -2,6 +2,7 @@ import path from "path";
 import { DEFAULT_CONFIG } from "./config-defaults.js";
 import { readJson } from "./json-io.js";
 import { decoratePatterns, estimateTokensRaw } from "./scoring.js";
+import { SKILL_EVIDENCE_VERSION } from "./skill-feedback-verifier.js";
 
 function safeOneLine(value, max = 240) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
@@ -25,19 +26,22 @@ export function isActiveSkillInjectable(skill = {}, config = DEFAULT_CONFIG) {
   const successCount = Number(evidence.successCount || 0);
   const regressionCount = Number(evidence.regressionCount || 0);
   return skill.status === "active"
+    && skill.identityVersion === 2
+    && evidence.verificationVersion === SKILL_EVIDENCE_VERSION
     && !!skill.rule
     && successCount >= minSuccess
     && regressionCount <= maxRegression
     && skill.injectable !== false;
 }
 
-export function selectInjectableActiveSkills(dataDir = "", config = DEFAULT_CONFIG) {
+export function selectInjectableActiveSkills(dataDir = "", config = DEFAULT_CONFIG, { project = null } = {}) {
   if (!config?.activeSkillsInjectionEnabled) return [];
   const maxCount = Math.max(0, Number(config.activeSkillsInjectionMaxCount ?? DEFAULT_CONFIG.activeSkillsInjectionMaxCount));
   if (maxCount <= 0) return [];
   const registry = loadActiveSkillRegistry(dataDir);
   return registry.skills
     .filter((skill) => isActiveSkillInjectable(skill, config))
+    .filter((skill) => !project || ["general", "global", project].includes(skill.scope?.project || "general"))
     .sort((a, b) => Number(b.evidence?.successCount || 0) - Number(a.evidence?.successCount || 0))
     .slice(0, maxCount);
 }

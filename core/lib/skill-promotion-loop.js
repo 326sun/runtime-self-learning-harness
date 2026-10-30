@@ -1,9 +1,11 @@
 import fs from "fs";
 import path from "path";
+import { createHash } from "node:crypto";
 import { safeFileSlug } from "./common.js";
 import { readActionFeedback } from "./action-runtime.js";
 import { loadActiveSkills, loadSkillCandidates, nowIso, saveActiveSkills, saveSkillCandidates } from "./skill-promotion-store.js";
 import { absorbFeedback, mergeCandidate, transitionCandidate, upsertActiveSkill } from "./skill-promotion-decision.js";
+import { SKILL_EVIDENCE_VERSION, readSkillVerificationReceipts } from "./skill-feedback-verifier.js";
 
 export {
   activeSkillRegistryPath,
@@ -34,12 +36,17 @@ function readReflexions(learnerDir) {
 }
 
 function clusterKey(reflexion = {}) {
-  return [
+  return JSON.stringify([
+    reflexion.scope?.project || reflexion.context?.project || "general",
     reflexion.taskType || "general",
     reflexion.actionType || "unknown_action",
     reflexion.failure?.errorType || reflexion.errorType || "unknown_error",
     reflexion.rootCause || "unknown_root_cause",
-  ].map((part) => String(part || "").trim()).join("|");
+    JSON.stringify({
+      beforePatch: reflexion.futureStrategy?.beforePatch || [],
+      afterPatch: reflexion.futureStrategy?.afterPatch || [],
+    }),
+  ].map((part) => String(part || "").trim()));
 }
 
 function clusterReflexions(reflexions, { promotionThreshold = 3 } = {}) {
@@ -53,7 +60,7 @@ function clusterReflexions(reflexions, { promotionThreshold = 3 } = {}) {
     existing.errorType = reflexion.failure?.errorType || reflexion.errorType || existing.errorType;
     existing.rootCause = reflexion.rootCause || existing.rootCause;
     existing.futureStrategy = reflexion.futureStrategy || existing.futureStrategy;
-    existing.scope = { ...(existing.scope || {}), ...(reflexion.scope || {}) };
+    existing.scope = { ...(existing.scope || {}), ...(reflexion.scope || {}), project: reflexion.scope?.project || reflexion.context?.project || "general" };
     clusters.set(key, existing);
   }
   return [...clusters.values()].map((cluster) => ({
@@ -72,17 +79,22 @@ function createSkillCandidateFromCluster(cluster = {}, { scope = {} } = {}) {
   if (!cluster.promotionCandidate) return null;
   const errorType = cluster.errorType || "unknown_error";
   const actionType = cluster.actionType || "unknown_action";
+  const project = cluster.scope?.project || scope.project || "general";
+  const projectKey = `${slug(project)}-${createHash("sha256").update(String(project)).digest("hex").slice(0, 10)}`;
+  const identityKey = createHash("sha256").update(cluster.key).digest("hex").slice(0, 16);
   const before = Array.isArray(cluster.futureStrategy?.beforePatch) ? cluster.futureStrategy.beforePatch : [];
   const after = Array.isArray(cluster.futureStrategy?.afterPatch) ? cluster.futureStrategy.afterPatch : [];
   return {
-    id: `skill_candidate:${slug(actionType)}:${slug(errorType)}`,
+    id: `skill_candidate:${projectKey}:${slug(actionType)}:${slug(errorType)}:${identityKey}`,
+    identityVersion: 2,
     rule: `Before ${errorType} repair, ${before.join("; ") || "check the root cause"}; after repair, ${after.join("; ") || "run verification"}.`,
     source: "reflexion_cluster",
     actionType,
     errorType,
-    scope: { ...scope, ...(cluster.scope || {}), taskTypes: [cluster.taskType || "general"].filter(Boolean) },
+    scope: { ...scope, ...(cluster.scope || {}), project, taskTypes: [cluster.taskType || "general"].filter(Boolean) },
     confidence: Math.min(0.95, 0.55 + cluster.items.length * 0.1),
     evidence: {
+      verificationVersion: SKILL_EVIDENCE_VERSION,
       failureCount: cluster.items.length,
       successCount: 0,
       regressionCount: 0,
@@ -111,8 +123,16 @@ export function runSkillPromotionLoop(learnerDir, options = {}) {
   const clusters = clusterReflexions(reflexions, { promotionThreshold });
   const promotableClusters = clusters.filter((cluster) => cluster.promotionCandidate);
   const store = loadSkillCandidates(learnerDir);
-  const byId = new Map(store.candidates.map((candidate) => [candidate.id, candidate]));
+  const legacy = store.candidates.filter((candidate) => candidate.identityVersion !== 2 || candidate.evidence?.verificationVersion !== SKILL_EVIDENCE_VERSION);
+  const byId = new Map(store.candidates.filter((candidate) => !legacy.includes(candidate)).map((candidate) => [candidate.id, candidate]));
   const events = [];
+  if (legacy.length) {
+    if (!dryRun) {
+      const backup = path.join(learnerDir, "skill_candidates.pre-evidence-v2.json");
+      if (!fs.existsSync(backup)) fs.writeFileSync(backup, JSON.stringify(store, null, 2), "utf8");
+    }
+    events.push({ type: "candidate.legacy_evidence_quarantined", count: legacy.length });
+  }
 
   for (const cluster of promotableClusters) {
     const incoming = createSkillCandidateFromCluster(cluster, { scope: { errorType: cluster.errorType } });
@@ -125,11 +145,13 @@ export function runSkillPromotionLoop(learnerDir, options = {}) {
   }
 
   const feedbackRows = readActionFeedback(learnerDir, { limit: feedbackLimit });
+  const receipts = readSkillVerificationReceipts(learnerDir);
   const nextCandidates = [];
   let activeRegistry = loadActiveSkills(learnerDir);
+  activeRegistry = { ...activeRegistry, skills: activeRegistry.skills.filter((skill) => byId.has(skill.id)) };
 
   for (const candidate of byId.values()) {
-    const absorbed = absorbFeedback(candidate, feedbackRows);
+    const absorbed = absorbFeedback(candidate, feedbackRows, receipts);
     if (absorbed.consumed > 0) events.push({ type: "candidate.feedback_absorbed", candidateId: candidate.id, count: absorbed.consumed });
     const transitioned = transitionCandidate(absorbed.candidate, { minSuccess, activeSuccess, maxRegression, now, halfLifeDays: options.halfLifeDays, removeDecayedBelow: options.removeDecayedBelow });
     if (transitioned.beforeStatus !== transitioned.candidate.status || transitioned.decision !== "keep_candidate") {

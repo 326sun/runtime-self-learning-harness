@@ -11,6 +11,30 @@ async function jsonResult(result) {
   return JSON.parse(result.content[0].text);
 }
 
+function emitToolCall(event, session, callId, name, args) {
+  event(session, { type: "tool/call", data: { callId, name, arguments: JSON.stringify(args) } });
+}
+
+function emitToolResult(event, session, callId, text, { errorCode = null } = {}) {
+  const isError = Boolean(errorCode);
+  event(session, {
+    type: "tool/result",
+    data: {
+      ...(errorCode ? { error: { code: errorCode } } : {}),
+      message: {
+        role: "user",
+        source: { kind: "tool", callId },
+        content: [{
+          type: "tool-result",
+          toolCallId: callId,
+          isError,
+          content: [{ type: "text", text }],
+        }],
+      },
+    },
+  });
+}
+
 test("creates a general-scope context by default and a project context when configured", () => {
   assert.equal(createContext({}).sessionPath, path.join("sessions", "00000000"));
   assert.equal(createContext({ HARNESS_PROJECT: "harness" }).sessionPath, path.join("projects", "harness"));
@@ -126,8 +150,8 @@ test("repeated failed tool turns become a skill-evolution candidate", async () =
   const event = handlers.get("session/event");
   for (let i = 0; i < 3; i += 1) {
     const session = { id: `failed-session-${i}`, header: { cwd: path.join(dataDir, "projects", "skill") } };
-    event(session, { type: "tool/call", data: { callId: `call-${i}`, name: "shell_exec", arguments: "{}" } });
-    event(session, { type: "tool/result", data: { callId: `call-${i}`, error: { code: "permission_denied", message: "blocked" }, message: { content: [] } } });
+    emitToolCall(event, session, `call-${i}`, "shell_exec", { command: "run restricted action" });
+    emitToolResult(event, session, `call-${i}`, "permission denied", { errorCode: "permission_denied" });
     event(session, { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: "failed" }] } } });
     event(session, { type: "turn/end", data: { reason: "error" } });
   }
@@ -137,18 +161,50 @@ test("repeated failed tool turns become a skill-evolution candidate", async () =
   assert.equal(evolved.ok, true);
   assert.ok(evolved.counts.promotableClusters >= 1);
   assert.ok(evolved.candidates.length >= 1);
-  const candidateId = automaticCandidates.candidates[0].id;
+  const candidate = automaticCandidates.candidates[0];
+  const candidateId = candidate.id;
+  await fs.writeFile(path.join(dataDir, "skill_verification_contracts.json"), JSON.stringify({
+    schemaVersion: 1,
+    contracts: [{
+      candidateId,
+      project: "skill",
+      rule: candidate.rule,
+      strategy: { tool: candidate.actionType, arguments: { command: "apply candidate strategy" } },
+      verification: {
+        tool: "test_runner", arguments: { command: "run candidate check" },
+        resultPath: ["checks", "repair"], successValue: true, regressionValue: false,
+      },
+    }],
+  }));
   for (let i = 0; i < 7; i += 1) {
-    await registered.get("learning_skill_feedback").execute({ candidateId, outcome: "success", verification: { verified: true, reason: "verified strategy execution" } });
+    const session = { id: `feedback-session-${i}`, header: { cwd: path.join(dataDir, "projects", "skill") } };
+    const exec = { agent: { id: `feedback-agent-${i}`, session } };
+    const trial = await registered.get("learning_skill_feedback").execute({ candidateId, phase: "begin" }, exec);
+    emitToolCall(event, session, `strategy-call-${i}`, candidate.actionType, { command: "apply candidate strategy" });
+    emitToolResult(event, session, `strategy-call-${i}`, "strategy applied");
+    emitToolCall(event, session, `verification-call-${i}`, "test_runner", { command: "run candidate check" });
+    emitToolResult(event, session, `verification-call-${i}`, JSON.stringify({ checks: { repair: true } }));
+    const result = await registered.get("learning_skill_feedback").execute({ candidateId, phase: "complete", trialId: trial.trialId }, exec);
+    assert.equal(result.outcome, "success");
+    event(session, { type: "turn/end", data: { reason: "completed" } });
   }
   const active = await registered.get("learning_skill_evolve").execute({ options: { minSuccess: 1, activeSuccess: 7 } });
   assert.ok(active.activeSkills.some((skill) => skill.id.includes("shell_exec")));
+  const regressionSession = { id: "feedback-regression-session", header: { cwd: path.join(dataDir, "projects", "skill") } };
   const preStep = await handlers.get("agent/pre-step")({
-    agent: { id: "active-agent", session: { id: "active-agent", header: { cwd: path.join(dataDir, "projects", "skill") } } },
+    agent: { id: "active-agent", session: regressionSession },
     messages: [{ role: "user", content: [{ type: "text", text: "use shell_exec" }] }],
   }, async () => ({ kind: "enter", messages: [{ role: "user", content: [{ type: "text", text: "use shell_exec" }] }] }));
   assert.match(preStep.messages[0].content[0].text, /active-skill/);
-  await registered.get("learning_skill_feedback").execute({ candidateId, outcome: "regression", verification: { verified: true, reason: "verified regression after active skill use" } });
+  const regressionExec = { agent: { id: "different-agent-id", session: regressionSession } };
+  const trial = await registered.get("learning_skill_feedback").execute({ candidateId, phase: "begin" }, regressionExec);
+  emitToolCall(event, regressionSession, "regression-strategy-call", candidate.actionType, { command: "apply candidate strategy" });
+  emitToolResult(event, regressionSession, "regression-strategy-call", "strategy applied");
+  emitToolCall(event, regressionSession, "regression-verification-call", "test_runner", { command: "run candidate check" });
+  emitToolResult(event, regressionSession, "regression-verification-call", JSON.stringify({ checks: { repair: false } }));
+  const feedback = await registered.get("learning_skill_feedback").execute({ candidateId, phase: "complete", trialId: trial.trialId }, regressionExec);
+  assert.equal(feedback.outcome, "regression");
+  event(regressionSession, { type: "turn/end", data: { reason: "completed" } });
   const regressed = await registered.get("learning_skill_evolve").execute({ options: { minSuccess: 1, activeSuccess: 7 } });
   assert.equal(regressed.activeSkills.some((skill) => skill.id.includes("shell_exec")), false);
   assert.ok(regressed.candidates.some((candidate) => candidate.status === "decayed"));
@@ -188,4 +244,97 @@ test("turn boundaries, failure mapping, and per-agent project scope follow nativ
   const beta = await registrations.get("memory_list").execute({ limit: 20 }, { agent: { session: { header: { cwd: path.join(dataDir, "projects", "beta") } } } });
   assert.equal(alpha.memories.some((item) => item.id === "alpha-memory"), true);
   assert.equal(beta.memories.some((item) => item.id === "alpha-memory"), false);
+});
+
+test("identical failures in different projects create isolated skill candidates", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "harness-project-candidates-"));
+  const handlers = new Map();
+  const ctx = {
+    dataDir, pluginDir: dataDir,
+    log: { info() {}, warn() {}, error() {}, debug() {} },
+    on(name, listener) { handlers.set(name, listener); return () => {}; },
+    tools: { register() { return () => {}; } },
+  };
+  apply(ctx);
+  const event = handlers.get("session/event");
+  for (const project of ["alpha", "beta"]) {
+    for (let i = 0; i < 3; i += 1) {
+      const session = { id: `${project}-session-${i}`, header: { cwd: path.join(dataDir, "projects", project) } };
+      const callId = `${project}-call-${i}`;
+      emitToolCall(event, session, callId, "shell_exec", { command: "run restricted action" });
+      emitToolResult(event, session, callId, "permission denied", { errorCode: "permission_denied" });
+      event(session, { type: "turn/end", data: { reason: "error" } });
+    }
+  }
+  const store = JSON.parse(await fs.readFile(path.join(dataDir, "skill_candidates.json"), "utf8"));
+  const projectCandidates = store.candidates.filter((candidate) => ["alpha", "beta"].includes(candidate.scope?.project));
+  assert.equal(projectCandidates.length, 2);
+  assert.notEqual(projectCandidates[0].id, projectCandidates[1].id);
+  assert.deepEqual(new Set(projectCandidates.map((candidate) => candidate.scope.project)), new Set(["alpha", "beta"]));
+});
+
+test("ordinary successful turns do not create skill verification evidence", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "harness-no-auto-skill-evidence-"));
+  const handlers = new Map();
+  const candidate = {
+    id: "skill_candidate:alpha:shell_exec:permission_denied",
+    actionType: "shell_exec",
+    errorType: "permission_denied",
+    rule: "Apply the project-specific recovery strategy and run its test.",
+    scope: { project: "alpha", taskTypes: ["general"] },
+    status: "active",
+    identityVersion: 2,
+    evidence: { verificationVersion: 2, successCount: 7, regressionCount: 0 },
+  };
+  await fs.writeFile(path.join(dataDir, "skill_candidates.json"), JSON.stringify({ candidates: [candidate] }));
+  await fs.writeFile(path.join(dataDir, "active_skills.json"), JSON.stringify({ skills: [candidate] }));
+  const ctx = {
+    dataDir, pluginDir: dataDir,
+    log: { info() {}, warn() {}, error() {}, debug() {} },
+    on(name, listener) { handlers.set(name, listener); return () => {}; },
+    tools: { register() { return () => {}; } },
+  };
+  apply(ctx);
+  const session = { id: "session-alpha", header: { cwd: path.join(dataDir, "projects", "alpha") } };
+  await handlers.get("agent/pre-step")({
+    agent: { id: session.id, session },
+    messages: [{ role: "user", content: [{ type: "text", text: "run the task" }] }],
+  }, async () => ({ kind: "enter", messages: [{ role: "user", content: [{ type: "text", text: "run the task" }] }] }));
+  const event = handlers.get("session/event");
+  const callId = "ordinary-call";
+  emitToolCall(event, session, callId, "shell_exec", { command: "unrelated task" });
+  emitToolResult(event, session, callId, "completed");
+  event(session, { type: "turn/end", data: { reason: "completed" } });
+  let feedback = "";
+  try { feedback = await fs.readFile(path.join(dataDir, "action_feedback.jsonl"), "utf8"); } catch (error) { assert.equal(error.code, "ENOENT"); }
+  assert.equal(feedback.includes(candidate.id), false);
+});
+
+test("skill feedback rejects a verified boolean without observed execution evidence", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "harness-unverified-skill-feedback-"));
+  const registered = new Map();
+  const ctx = {
+    dataDir, pluginDir: dataDir,
+    log: { info() {}, warn() {}, error() {}, debug() {} },
+    on() { return () => {}; },
+    tools: { register(tool) { registered.set(tool.name, tool); return () => {}; } },
+  };
+  apply(ctx);
+  const candidate = {
+    id: "skill_candidate:alpha:shell_exec:permission_denied",
+    actionType: "shell_exec",
+    errorType: "permission_denied",
+    rule: "Apply the recovery strategy and verify it.",
+    scope: { project: "alpha", taskTypes: ["general"] },
+    evidence: { failureCount: 3, successCount: 0, regressionCount: 0, feedbackIds: [] },
+  };
+  await fs.writeFile(path.join(dataDir, "skill_candidates.json"), JSON.stringify({ candidates: [candidate] }));
+  await assert.rejects(
+    registered.get("learning_skill_feedback").execute({
+      candidateId: candidate.id,
+      outcome: "success",
+      verification: { verified: true, reason: "the caller says it passed" },
+    }),
+    /execution evidence|strategy application|missing required property "phase"/i,
+  );
 });
