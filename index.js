@@ -124,6 +124,9 @@ export function apply(ctx) {
   registerLearning(ctx, "learning_skill_evolve", "Run the review-gated skill evolution loop and refresh the generated self-learning skill.",
     { options: { type: "object", additionalProperties: true } },
     (args) => ({ action: "evolve", ...args }));
+  registerLearning(ctx, "learning_skill_feedback", "Record verified success or regression for one skill candidate and run the promotion loop.",
+    { candidateId: { type: "string", required: true }, outcome: { type: "string", enum: ["success", "regression"], required: true }, verification: { type: "object", required: true, additionalProperties: true } },
+    (args) => ({ action: "feedback", ...args }));
   registerLearning(ctx, "learning_skill_render", "Render the current learned patterns and active skills to the local generated skill file.",
     { }, (args) => ({ action: "render_skill", ...args }));
 }

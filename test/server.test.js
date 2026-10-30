@@ -137,23 +137,19 @@ test("repeated failed tool turns become a skill-evolution candidate", async () =
   assert.equal(evolved.ok, true);
   assert.ok(evolved.counts.promotableClusters >= 1);
   assert.ok(evolved.candidates.length >= 1);
-
-  const completeTurn = (id, failed = false) => {
-    const session = { id, header: { cwd: path.join(dataDir, "projects", "skill") } };
-    event(session, { type: "tool/call", data: { callId: `${id}-call`, name: "shell_exec", arguments: "{}" } });
-    event(session, failed
-      ? { type: "tool/result", data: { callId: `${id}-call`, error: { code: "permission_denied" }, message: { content: [], isError: true } } }
-      : { type: "tool/result", data: { callId: `${id}-call`, message: { content: [{ type: "text", text: "ok" }] } } });
-    event(session, { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: failed ? "failed" : "fixed" }] } } });
-    event(session, { type: "turn/end", data: { reason: failed ? "error" : "completed" } });
-  };
-  completeTurn("success-1");
-  completeTurn("success-2");
-  await registered.get("learning_skill_evolve").execute({ options: { minSuccess: 1, activeSuccess: 2 } });
-  const active = await registered.get("learning_skill_evolve").execute({ options: { minSuccess: 1, activeSuccess: 2 } });
+  const candidateId = automaticCandidates.candidates[0].id;
+  for (let i = 0; i < 7; i += 1) {
+    await registered.get("learning_skill_feedback").execute({ candidateId, outcome: "success", verification: { verified: true, reason: "verified strategy execution" } });
+  }
+  const active = await registered.get("learning_skill_evolve").execute({ options: { minSuccess: 1, activeSuccess: 7 } });
   assert.ok(active.activeSkills.some((skill) => skill.id.includes("shell_exec")));
-  completeTurn("regression-1", true);
-  const regressed = await registered.get("learning_skill_evolve").execute({ options: { minSuccess: 1, activeSuccess: 2 } });
+  const preStep = await handlers.get("agent/pre-step")({
+    agent: { id: "active-agent", session: { id: "active-agent", header: { cwd: path.join(dataDir, "projects", "skill") } } },
+    messages: [{ role: "user", content: [{ type: "text", text: "use shell_exec" }] }],
+  }, async () => ({ kind: "enter", messages: [{ role: "user", content: [{ type: "text", text: "use shell_exec" }] }] }));
+  assert.match(preStep.messages[0].content[0].text, /active-skill/);
+  await registered.get("learning_skill_feedback").execute({ candidateId, outcome: "regression", verification: { verified: true, reason: "verified regression after active skill use" } });
+  const regressed = await registered.get("learning_skill_evolve").execute({ options: { minSuccess: 1, activeSuccess: 7 } });
   assert.equal(regressed.activeSkills.some((skill) => skill.id.includes("shell_exec")), false);
   assert.ok(regressed.candidates.some((candidate) => candidate.status === "decayed"));
 });

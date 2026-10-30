@@ -27,13 +27,13 @@ Harness session/event
 
 ## 官方安装
 
-这是官方 DSH bundle，包含 `dsh.bundle` 和 `cordis.patch.yml`：
+这是官方 DSH bundle：根目录 `package.json` 声明 `dsh.bundle.patch`，由 `cordis.patch.yml` 完成 Cordis 注入；包内没有名为 `dsh.bundle` 的独立文件。
 
 ```powershell
 dsh plugin --profile web add github:326sun/runtime-self-learning-harness
 ```
 
-安装后重启对应 profile。原生 bundle 会注册 17 个工具，并自动连接 DSH 的 session 与 agent 生命周期。
+安装后重启对应 profile。原生 bundle 会注册 18 个工具，并自动连接 DSH 的 session 与 agent 生命周期。
 
 默认数据目录：
 
@@ -64,13 +64,14 @@ dsh plugin --profile web add github:326sun/runtime-self-learning-harness
 | `learning_observe` | 手动提交一个受限回合，用于诊断或离线回放；正常 Harness 回合会自动观察 |
 | `learning_inject` | 预览某个查询和项目将获得的记忆注入 |
 | `learning_skill_evolve` | 运行技能候选晋级循环；默认不直接写安装目录 |
+| `learning_skill_feedback` | 提交带独立验证的候选成功/回归反馈 |
 | `learning_skill_render` | 将当前模式和已激活技能渲染到数据目录 |
 
 自动链路由原生 DSH 事件驱动：
 
 - `session/event` → 观察用户消息、工具调用/结果和助手消息；
 - `agent/pre-step` → 注入当前作用域的可用记忆；
-- `agent/session-start` → 为新会话准备初始记忆上下文。
+- `agent/created` → 为新 Agent 准备初始记忆上下文。
 
 ## 记忆与治理
 
@@ -80,6 +81,8 @@ dsh plugin --profile web add github:326sun/runtime-self-learning-harness
 - 事实保留 `validFrom`、`validTo`、`learnedAt` 与替代关系，不静默覆盖历史。
 - 删除是逻辑隐藏；旧日志和已有外部备份不会被承诺安全擦除。
 - 技能文件生成到 `<dataDir>/generated/`，候选晋级受成功次数、回归次数和治理门槛限制。
+- 已激活技能会在通过成功/回归证据门槛后进入 `agent/pre-step`；没有候选 ID、策略应用标记和 `verification.verified=true` 的普通工具成功不会计入技能证据。
+- Harness 版本默认关闭自动动作执行，只进行观察、检索、注入和受治理的技能反馈。
 - 默认不调用外部模型，不上传原始对话，不执行自动代码补丁。
 
 ## MCP 兼容入口
@@ -103,7 +106,7 @@ npm test
 npm audit --omit=dev
 ```
 
-测试覆盖：记忆读写、统一检索门控、作用域、原生 17 工具注册、DSH session/turn/agent 事件观察、工具调用配对、自动注入、重复失败聚类、成功/回归反馈、宿主 dataDir 隔离和技能演化 dry-run。
+测试覆盖：记忆读写、统一检索门控、作用域、原生 18 工具注册、DSH session/turn/agent 事件观察、工具调用配对、自动注入、重复失败聚类、成功/回归反馈、宿主 dataDir 隔离和技能演化 dry-run。
 
 生产宿主仍应使用实际 profile 做一次安装、真实多轮对话、项目切换、导入预览和技能晋级验收。
 

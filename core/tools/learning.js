@@ -36,6 +36,7 @@ export async function executeLearning(input = {}, ctx = {}) {
       return { ok: true, injected: Boolean(text), text };
     }
     case "evolve": return runtime.evolveSkills(input.options || {});
+    case "feedback": return runtime.recordSkillFeedback(input.candidateId, input.outcome, input.verification || {});
     case "render_skill": return runtime.renderSkill();
     default: throw new Error(`unknown learning action: ${input.action}`);
   }

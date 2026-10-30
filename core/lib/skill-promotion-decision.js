@@ -2,8 +2,9 @@ import { nowIso } from "./skill-promotion-store.js";
 
 function updateSkillEvidence(candidate, row) {
   const evidence = candidate.evidence || {};
-  const effective = row.effective === true || row.success === true;
-  const regressed = row.regression === true || row.effective === false;
+  const verified = row.verification?.verified === true && row.strategyApplied === true;
+  const effective = verified && (row.effective === true || row.success === true);
+  const regressed = verified && (row.regression === true || row.effective === false);
   return {
     ...candidate,
     evidence: {
@@ -63,13 +64,19 @@ function candidateErrorType(candidate = {}) {
 }
 
 function feedbackMatchesCandidate(candidate = {}, row = {}) {
-  if (row.skillCandidateId === candidate.id || row.candidateId === candidate.id) return true;
+  if (row.skillCandidateId === candidate.id || row.candidateId === candidate.id) {
+    return row.verification?.verified === true && row.strategyApplied === true;
+  }
+  if (row.strategyApplied !== true || row.verification?.verified !== true) return false;
   const scopeTaskTypes = Array.isArray(candidate.scope?.taskTypes) ? candidate.scope.taskTypes : [];
   const taskTypeMatches = !row.taskType || scopeTaskTypes.length === 0 || scopeTaskTypes.includes(row.taskType);
   const errorType = candidateErrorType(candidate);
   const errorMatches = !row.errorType || !errorType || row.errorType === errorType;
   const actionTypeMatches = !row.actionType || !candidate.actionType || row.actionType === candidate.actionType;
-  return taskTypeMatches && errorMatches && actionTypeMatches && (row.effective === true || row.effective === false || row.success === true || row.regression === true);
+  const candidateProject = candidate.scope?.project || "general";
+  const rowProject = row.scope?.project || "general";
+  const projectMatches = candidateProject === "general" || rowProject === "general" || candidateProject === rowProject;
+  return taskTypeMatches && errorMatches && actionTypeMatches && projectMatches && (row.effective === true || row.effective === false || row.success === true || row.regression === true);
 }
 
 export function absorbFeedback(candidate = {}, feedbackRows = []) {
